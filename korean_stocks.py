@@ -2,8 +2,8 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import plotly.graph_objects as go
-import plotly.express as px
-from datetime import datetime, timedelta
+from datetime import datetime
+from openai import OpenAI
 
 st.set_page_config(
     page_title="국내 주식 대시보드",
@@ -11,7 +11,6 @@ st.set_page_config(
     layout="wide"
 )
 
-# 국내 주식 10개 (야후파이낸스 티커: 종목코드.KS 또는 .KQ)
 STOCKS = {
     "삼성전자": "005930.KS",
     "SK하이닉스": "000660.KS",
@@ -30,6 +29,16 @@ st.markdown("**KOSPI 대표 종목 10개** 실시간 데이터 (yfinance 기반)
 
 # 사이드바 설정
 st.sidebar.header("⚙️ 설정")
+
+# API 키 입력
+st.sidebar.subheader("🤖 AI 챗봇 설정")
+api_key = st.sidebar.text_input(
+    "OpenAI API Key",
+    type="password",
+    placeholder="sk-...",
+    help="GPT-4o-mini 챗봇 사용을 위해 API 키를 입력하세요."
+)
+
 selected_stocks = st.sidebar.multiselect(
     "종목 선택",
     options=list(STOCKS.keys()),
@@ -51,11 +60,13 @@ def load_stock_data(tickers: list, period: str):
             hist = stock.history(period=period)
             if not hist.empty:
                 data[name] = hist
-                info = stock.info
                 current_price = hist["Close"].iloc[-1]
                 prev_price = hist["Close"].iloc[-2] if len(hist) > 1 else current_price
                 change = current_price - prev_price
                 change_pct = (change / prev_price) * 100
+                high_52w = hist["High"].max()
+                low_52w = hist["Low"].min()
+                avg_volume = hist["Volume"].mean()
                 info_data.append({
                     "종목명": name,
                     "티커": ticker,
@@ -65,10 +76,42 @@ def load_stock_data(tickers: list, period: str):
                     "거래량": f"{hist['Volume'].iloc[-1]:,.0f}",
                     "_change_pct": change_pct,
                     "_current_price": current_price,
+                    "_high": high_52w,
+                    "_low": low_52w,
+                    "_avg_volume": avg_volume,
                 })
         except Exception as e:
             st.warning(f"{name} 데이터 로드 실패: {e}")
     return data, pd.DataFrame(info_data)
+
+def build_stock_context(summary_df: pd.DataFrame, hist_data: dict, period_label: str) -> str:
+    """챗봇에게 전달할 주식 데이터 컨텍스트 생성"""
+    lines = [f"[현재 대시보드 주식 데이터 - 기간: {period_label}]\n"]
+    for _, row in summary_df.iterrows():
+        name = row["종목명"]
+        lines.append(
+            f"- {name}: 현재가 {row['현재가']}, 전일대비 {row['전일대비']} ({row['등락률']}), "
+            f"거래량 {row['거래량']}, "
+            f"기간 최고 ₩{row['_high']:,.0f}, 기간 최저 ₩{row['_low']:,.0f}, "
+            f"평균거래량 {row['_avg_volume']:,.0f}"
+        )
+        if name in hist_data:
+            df = hist_data[name]
+            first = df["Close"].iloc[0]
+            last = df["Close"].iloc[-1]
+            total_return = (last - first) / first * 100
+            lines.append(f"  기간 수익률: {total_return:+.2f}%")
+    return "\n".join(lines)
+
+def chat_with_gpt(api_key: str, messages: list) -> str:
+    client = OpenAI(api_key=api_key)
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=messages,
+        temperature=0.7,
+        max_tokens=1000,
+    )
+    return response.choices[0].message.content
 
 if not selected_stocks:
     st.warning("종목을 하나 이상 선택해주세요.")
@@ -184,5 +227,55 @@ if not summary_df.empty:
         margin=dict(l=120)
     )
     st.plotly_chart(fig_bar, use_container_width=True)
+
+st.divider()
+
+# ── AI 챗봇 ──────────────────────────────────────────────
+st.subheader("🤖 AI 주식 분석 챗봇")
+
+if not api_key:
+    st.info("사이드바에 OpenAI API Key를 입력하면 챗봇을 사용할 수 있습니다.")
+else:
+    # 세션 상태 초기화
+    if "chat_messages" not in st.session_state:
+        st.session_state.chat_messages = []
+
+    stock_context = build_stock_context(summary_df, hist_data, selected_period_label)
+    system_prompt = (
+        "당신은 한국 주식 전문 AI 분석가입니다. "
+        "아래 실시간 주식 데이터를 바탕으로 사용자 질문에 한국어로 답변하세요. "
+        "데이터에 없는 내용은 모른다고 솔직히 말하고, 투자 권유는 하지 마세요.\n\n"
+        + stock_context
+    )
+
+    # 대화 기록 출력
+    for msg in st.session_state.chat_messages:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+
+    # 사용자 입력
+    if user_input := st.chat_input("주식에 대해 질문하세요. 예) 오늘 가장 많이 오른 종목은?"):
+        st.session_state.chat_messages.append({"role": "user", "content": user_input})
+        with st.chat_message("user"):
+            st.markdown(user_input)
+
+        with st.chat_message("assistant"):
+            with st.spinner("분석 중..."):
+                try:
+                    messages_to_send = [{"role": "system", "content": system_prompt}] + [
+                        {"role": m["role"], "content": m["content"]}
+                        for m in st.session_state.chat_messages
+                    ]
+                    answer = chat_with_gpt(api_key, messages_to_send)
+                    st.markdown(answer)
+                    st.session_state.chat_messages.append({"role": "assistant", "content": answer})
+                except Exception as e:
+                    err_msg = f"오류가 발생했습니다: {e}"
+                    st.error(err_msg)
+
+    if st.session_state.get("chat_messages"):
+        if st.button("대화 초기화"):
+            st.session_state.chat_messages = []
+            st.rerun()
 
 st.caption(f"마지막 업데이트: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | 데이터 출처: Yahoo Finance")
